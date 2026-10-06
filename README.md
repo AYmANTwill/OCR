@@ -6,7 +6,7 @@ official Aon look, the switch-challenge-pratice.org look, light and dark themes,
 
 | Game | How it is read | What it shows |
 |---|---|---|
-| A1 DigitChallenge | the text line holding an `=`; each character classified by shape (`?` hook+dot, `=`, `+`, `×`, `÷`, `−`, `(` `)`, `_` gap); digits by font templates | digits to type, left→right (distinct 1–9) + alternatives |
+| A1 DigitChallenge | the text line holding an `=`; each character classified by shape (`?` hook+dot, `=`, `+`, `×`, `÷`, `−`, `(` `)`, `_` gap); digits by font templates. When a skin draws the answer slots as filled/empty pills or bare boxes (no `?` ink) or hides thin `+` signs, a fallback reader scans the band for the operator/paren glyphs only, rebuilds the slot layout from grammar (`#operands = #binary-operators + 1`) and reads just the target number with OCR | digits to type, left→right (distinct 1–9) + alternatives |
 | A2 SwitchChallenge | two rows of the same coloured symbols (input/output); every number box between them, grouped in rows; boxes read by 2 OCR engines, only valid permutations kept | the box(es) to click, e.g. `2134` or `2134 + 2143` for two choice rows |
 | A3 R1 "Is it symmetrical?" | largest single-colour panel (any colour); element grid | YES / NO |
 | A3 R2 "Rotated but identical?" | both grids, 4 rotations vs mirror | YES / NO |

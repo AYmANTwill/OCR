@@ -7,16 +7,27 @@ Pipeline (structure first, OCR last):
      '×' (diagonal cross), '(' / ')' (tall, curved, below baseline).
   3. the remaining columns are digits, read by font templates (digits.py).
 Rules from the test: operands are distinct digits 1-9.
+
+A second, skin-robust reader runs when the column path above cannot solve the line (new
+"practice" look-and-feels draw the answer slots as filled/empty pills or bare boxes, so there
+is no '?' ink to segment, and thin '+' signs between boxes fall under the ink threshold).
+That reader (`robust_tokens`) never reads the operands at all: it scans the band for the
+operator/paren glyphs only, rebuilds the exact slot layout from arithmetic grammar
+(#operands = #binary-operators + 1), and reads just the right-hand target number with OCR.
 """
 import cv2
 import numpy as np
 
-import equation
 import digits
+import equation
+import ocr
 import textseg
+from vision import Box, components
 
 _cache: dict = {}
+_rhs_cache: dict = {}
 _last_good = {"skeleton": None, "result": None}
+_BINOPS = {"+", "-", "*", "/"}
 
 
 # ------------------------------------------------------------------ geometry
@@ -202,28 +213,177 @@ def _fmt(tokens):
     return out
 
 
+# ------------------------------------------------------------------ robust (skin-agnostic) reader
+def _otsu_mask(gray, box, dark):
+    sub = gray[box.y:box.y + box.h, box.x:box.x + box.w]
+    if sub.size == 0:
+        return np.zeros((1, 1), np.uint8)
+    if not dark:
+        sub = 255 - sub
+    _, th = cv2.threshold(sub, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return th
+
+
+def _is_filled_slot(mask):
+    """A solid, convex blob = an answer pill/box (filled slot), not an operator or digit.
+
+    Digits have internal holes/strokes (low fill); '+'/'×' are sparse; '(' ')' are thin
+    crescents. A filled pill is near-solid and near-convex, which none of those are.
+    """
+    xs = np.nonzero(mask)[1]
+    if len(xs) == 0:
+        return False
+    area = len(xs)
+    fill = area / (mask.shape[0] * mask.shape[1])
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return False
+    hull = cv2.contourArea(cv2.convexHull(max(cnts, key=cv2.contourArea)))
+    solidity = area / hull if hull > 0 else 0.0
+    return fill > 0.6 and solidity > 0.85
+
+
+def scan_operators(gray, ln, cols, shapes, H, mid):
+    """Operator/paren glyphs left of '=', found by geometry independently of column
+    segmentation (thin '+' signs between boxes are lost by the column path). Filled-pill
+    slots are suppressed so a solid pill is never mistaken for ')' or a digit.
+    -> list of signs in left-to-right order, e.g. ['(', '*', '*', ')', '+'].
+    """
+    eqi = shapes.index("=")
+    eqx = cols[eqi].x
+    y0 = max(0, int(ln.box.y - 0.4 * H))
+    y1 = int(ln.box.y + ln.box.h + 0.4 * H)
+    hits = []
+    for mask_pol, dark in zip(textseg.ink_masks(gray[y0:y1, :eqx]), (True, False)):
+        for b, _, _ in components(mask_pol, min_area=20):
+            box = Box(b.x, b.y + y0, b.w, b.h)
+            if box.h < 0.3 * H or box.h > 2.4 * H:
+                continue
+            th = _otsu_mask(gray, box, dark)
+            if _is_filled_slot(th):
+                continue
+            kind = None
+            if box.h < 0.95 * H and 0.6 < box.w / box.h < 1.6:
+                kind = _cross_kind(th)
+            if kind is None and box.h >= 0.7 * H and box.w < 0.5 * box.h:
+                kind = _paren_kind(th)
+            if kind is None and _is_flat(box) and abs((box.y + box.h / 2) - mid) < 0.3 * H:
+                kind = "-"
+            if kind in ("+", "*", "-", "/", "(", ")"):
+                hits.append((box.x, kind))
+    hits.sort()
+    out = []
+    for x, k in hits:
+        if out and k == out[-1][1] and abs(x - out[-1][0]) < 0.6 * H:
+            continue  # same glyph seen in both polarities
+        out.append((x, k))
+    return [k for _, k in out]
+
+
+def grammar_tokens(skeleton_signs):
+    """Rebuild the full left-hand token list from the operator/paren skeleton alone, placing
+    one GAP per operand factor. Valid because every operand is a single digit (test rule),
+    so #operands = #binary-operators + 1.
+    """
+    toks, expect_factor = [], True
+    for t in skeleton_signs:
+        if expect_factor and t != "(":
+            toks.append(equation.GAP)
+            expect_factor = False
+        toks.append(t)
+        if t == "(" or t in _BINOPS:
+            expect_factor = True
+        elif t == ")":
+            expect_factor = False
+    if expect_factor:
+        toks.append(equation.GAP)
+    return toks
+
+
+def _read_rhs_number(gray, ln, cols, eqi):
+    """The target number right of '=' (can be multi-digit and contain 0). OCR first (handles
+    any font/weight), then the font-template recogniser as a fallback when no engine is present.
+    """
+    rhs = cols[eqi + 1:]
+    if not rhs:
+        return ""
+    x0 = min(c.x for c in rhs)
+    x1 = max(c.x + c.w for c in rhs)
+    y0 = min(c.y for c in rhs)
+    y1 = max(c.y + c.h for c in rhs)
+    crop = textseg.crop_for_ocr(gray, Box(x0, y0, x1 - x0, y1 - y0), ln.dark)
+    key = hash(crop.tobytes())
+    if key in _rhs_cache:
+        return _rhs_cache[key]
+    out = ""
+    for text in ocr.win_read_batch([crop]) + ocr.tess_read_batch([crop], "0123456789"):
+        digs = "".join(ch for ch in text if ch.isdigit())
+        if digs:
+            out = digs
+            break
+    else:
+        for c in rhs:
+            d, _, _ = digits.classify(digits.glyph_mask(gray, c, ln.dark))
+            out += d if d is not None else ""
+    if len(_rhs_cache) > 500:
+        _rhs_cache.clear()
+    _rhs_cache[key] = out
+    return out
+
+
+def robust_tokens(gray, ln, cols, shapes, H, mid):
+    """Skin-agnostic token list for one '='-bearing line, or None if it cannot be rebuilt."""
+    if "=" not in shapes:
+        return None
+    eqi = shapes.index("=")
+    signs = scan_operators(gray, ln, cols, shapes, H, mid)
+    rhs = _read_rhs_number(gray, ln, cols, eqi)
+    if not rhs:
+        return None
+    toks = grammar_tokens(signs) + ["="] + list(rhs)
+    return toks if toks.count("=") == 1 and equation.GAP in toks else None
+
+
+def _result(toks, sols):
+    shown = ["?" if t is equation.GAP else t for t in toks]
+    _last_good.update(skeleton=skeleton(toks), result=sols)
+    lines = [f"Eq: {_fmt(toks)}", f"{len(sols)}{'+' if len(sols) >= 8 else ''} solution(s)"]
+    if len(sols) > 1:
+        lines.append("alt: " + " | ".join(" ".join(map(str, s)) for s in sols[1:4]))
+    return {"mode": "A1 Digit", "lines": lines, "big": "  ".join(map(str, sols[0])),
+            "tokens": shown, "solution": list(sols[0])}
+
+
 def analyse(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     found = find_equation_lines(gray)
     if not found:
         return None
     found.sort(key=lambda t: -t[3])  # the task equation is the largest '=' line
+    # pass 1: original column/template reader (keeps the proven Aon / official behaviour)
     for ln, cols, shapes, _, _ in found:
         toks = read_equation(gray, ln, cols, shapes)
         if toks.count("=") != 1 or "#" in toks:
             continue
         sols, solved = solve_tokens(toks)
-        shown = ["?" if t is None else t for t in solved]
         if sols:
-            _last_good.update(skeleton=skeleton(toks), result=sols)
-            lines = [f"Eq: {_fmt(solved)}", f"{len(sols)}{'+' if len(sols) >= 8 else ''} solution(s)"]
-            if len(sols) > 1:
-                lines.append("alt: " + " | ".join(" ".join(map(str, s)) for s in sols[1:4]))
-            return {"mode": "A1 Digit", "lines": lines, "big": "  ".join(map(str, sols[0])),
-                    "tokens": shown, "solution": list(sols[0])}
-        if _last_good["result"] and _last_good["skeleton"] == skeleton(toks):
-            return {"mode": "A1 Digit", "lines": ["all gaps filled", f"Eq: {_fmt(toks)}"],
-                    "big": "  ".join(map(str, _last_good["result"][0])), "tokens": shown}
-        return {"mode": "A1 Digit", "lines": [f"Eq: {_fmt(toks)}", "no valid solution (misread?)"],
-                "big": "?", "tokens": shown}
-    return None
+            res = _result(solved, sols)
+            res["tokens"] = ["?" if t is None else t for t in solved]
+            return res
+    # pass 2: skin-robust reader (pills / boxes / thin operators / cartoon fonts)
+    for ln, cols, shapes, H, mid in found:
+        rt = robust_tokens(gray, ln, cols, shapes, H, mid)
+        if rt is None:
+            continue
+        sols = equation.solve(rt)
+        if sols:
+            return _result(rt, sols)
+    # pass 3: nothing solved — report the best read for the user / ctrl+alt+d dump
+    ln, cols, shapes, _, _ = found[0]
+    toks = read_equation(gray, ln, cols, shapes)
+    shown = ["?" if t is None else t for t in toks]
+    if _last_good["result"] and "=" in toks and _last_good["skeleton"] == skeleton(toks):
+        return {"mode": "A1 Digit", "lines": ["all gaps filled", f"Eq: {_fmt(toks)}"],
+                "big": "  ".join(map(str, _last_good["result"][0])), "tokens": shown}
+    return {"mode": "A1 Digit", "lines": [f"Eq: {_fmt(toks)}", "no valid solution (misread?)"],
+            "big": "?", "tokens": shown}
