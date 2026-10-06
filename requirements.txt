@@ -1,0 +1,8 @@
+numpy
+opencv-python
+pillow
+mss
+winocr
+pytesseract
+keyboard
+pytest

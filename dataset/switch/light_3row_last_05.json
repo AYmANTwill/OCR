@@ -1,0 +1,1 @@
+{"game": "switch", "variant": "3row_last", "top": ["#79b801:circle", "#4bbbea:pathM4 9a2 2 0 0", "#e21b22:rect", "#ffbc1c:pathM13.73 4a2 2"], "bottom": ["#4bbbea:pathM4 9a2 2 0 0", "#79b801:circle", "#e21b22:rect", "#ffbc1c:pathM13.73 4a2 2"], "rows": [[[4, 1, 2, 3]], [[2, 4, 3, 1]], [[3, 1, 2, 4], [4, 1, 3, 2], [4, 2, 1, 3]]], "answers": [[0, 0, 0]]}
