@@ -462,22 +462,24 @@ def _ocr_number(crop):
 
 
 def _read_rhs_number(gray, ln, cols, eqi, keypad=None):
-    """Target number right of '=' on a found line (keypad + OCR; template fallback)."""
+    """Target number right of '=' on a found line (keypad + OCR; template fallback). A leading
+    flat bar is a minus sign, so the target can be negative (the test allows e.g. '= -6')."""
     rhs = cols[eqi + 1:]
     if not rhs:
         return ""
-    x0 = min(c.x for c in rhs)
-    x1 = max(c.x + c.w for c in rhs)
-    y0 = min(c.y for c in rhs)
-    y1 = max(c.y + c.h for c in rhs)
+    neg = len(rhs) > 1 and _is_flat(rhs[0])
+    digit_cols = rhs[1:] if neg else rhs
+    x0 = min(c.x for c in digit_cols)
+    x1 = max(c.x + c.w for c in digit_cols)
+    y0 = min(c.y for c in digit_cols)
+    y1 = max(c.y + c.h for c in digit_cols)
     crop = textseg.crop_for_ocr(gray, Box(x0, y0, x1 - x0, y1 - y0), ln.dark)
-    out = _read_number(gray, rhs, ln.dark, crop, keypad)
-    if out:
-        return out
-    for c in rhs:
-        d, _, _ = digits.classify(digits.glyph_mask(gray, c, ln.dark))
-        out += d if d is not None else ""
-    return out
+    out = _read_number(gray, digit_cols, ln.dark, crop, keypad)
+    if not out:
+        for c in digit_cols:
+            d, _, _ = digits.classify(digits.glyph_mask(gray, c, ln.dark))
+            out += d if d is not None else ""
+    return ("-" + out) if (neg and out) else out
 
 
 def robust_tokens(gray, ln, cols, shapes, H, mid, keypad=None):
@@ -553,7 +555,15 @@ def _rhs_right_of(gray, eqbox, dark, keypad=None):
     y0 = min(b.y for b in grp)
     y1 = max(b.y + b.h for b in grp)
     crop = textseg.crop_for_ocr(gray, Box(x0, y0, x1 - x0, y1 - y0), dark)
-    return _read_number(gray, grp, dark, crop, keypad), H, mid
+    num = _read_number(gray, grp, dark, crop, keypad)
+    neg = False  # a flat bar between '=' and the first digit, at mid-height, is a minus sign
+    for mask, dk in zip(textseg.ink_masks(gray), (True, False)):
+        if dk != dark:
+            continue
+        for b, _, _ in components(mask, min_area=15):
+            if cx - 2 <= b.x and b.x + b.w <= x0 + 2 and b.w >= 2.2 * b.h and abs(b.cy - mid) < 0.4 * H:
+                neg = True
+    return (("-" + num) if (neg and num) else num), H, mid
 
 
 def robust_from_equals(gray, keypad=None):

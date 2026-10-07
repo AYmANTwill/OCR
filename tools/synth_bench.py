@@ -71,7 +71,7 @@ def _pick(symbols, eval_str, rng):
     for _ in range(400):
         vals = rng.sample(range(1, 10), n)
         rhs = eval(eval_str % tuple(vals))
-        if isinstance(rhs, int) and rhs > 0:
+        if isinstance(rhs, int) and rhs != 0:   # targets may be negative (e.g. '= -6')
             return vals, rhs
     return None, None
 
@@ -172,7 +172,8 @@ def main():
             sol = None
         ok = _valid(gt, sol)
         for dim, key in [("slot", style["slot"]), ("theme", style["theme"]), ("font", style["font"]),
-                         ("size", str(style["size"])), ("struct", " ".join(tmpl[0])), ("ALL", "all")]:
+                         ("size", str(style["size"])), ("struct", " ".join(tmpl[0])),
+                         ("sign", "neg" if rhs < 0 else "pos"), ("ALL", "all")]:
             stats[(dim, key)][0] += ok
             stats[(dim, key)][1] += 1
         if not ok:
@@ -185,7 +186,7 @@ def main():
         return f"{c / t * 100:5.1f}%  ({c}/{t})" if t else "n/a"
 
     print("\nOVERALL:", line(("ALL", "all")), f"  [{len(FONTS)} fonts]")
-    for dim in ["slot", "theme", "font", "size", "struct"]:
+    for dim in ["sign", "slot", "theme", "font", "size", "struct"]:
         print(f"\n-- by {dim} --")
         for k in sorted((k for k in stats if k[0] == dim), key=lambda k: stats[k][0] / stats[k][1]):
             print(f"  {k[1]:<26} {line(k)}")
