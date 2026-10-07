@@ -87,6 +87,14 @@ def test_a2_official_style():
     assert a2_tubes.analyse(_img("a2_tubes.png"))["big"] == "3241"
 
 
+def test_a2_solve_unknown_operator():
+    # operator-conversion ('inverted'): input + 1324 + x + 3241 = output; recover x.
+    x = [2, 4, 1, 3]
+    target = a2_tubes.compose_chain([[1, 3, 2, 4], x, [3, 2, 4, 1]])
+    assert a2_tubes.solve_unknown(target, [[1, 3, 2, 4], None, [3, 2, 4, 1]]) == [tuple(x)]
+    assert a2_tubes.solve_unknown((2, 1, 4, 3), [None]) == [(2, 1, 4, 3)]
+
+
 def test_a2_practice_site_user_screen():
     res = a2_tubes.analyse(_img("practice_switch_user.png"))
     assert res["big"] == "2431" and res["target"] == (2, 4, 3, 1)
