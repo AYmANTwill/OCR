@@ -208,11 +208,38 @@ class DotTracker:
         self.dot_hsv = None  # set by the calibrate hotkey
         self.recall = False
         self._visible = False
+        self._hi_visible = False
         self._no_dot_since = None
+        self._aon_no_hi_since = None
         self._new_trial = False
 
     def reset(self):
         self.dots, self._visible, self.recall, self._new_trial = [], False, False, False
+        self._hi_visible = False
+        self._aon_no_hi_since = None
+
+    def aon_see(self, rel, board_present, now=None):
+        """Aon rendering: one orange-ringed dot is highlighted per 'memorise' board for a few
+        seconds, with plain task screens in between (no board). `rel` is the highlighted dot's
+        position normalised to the board, or None. A new dot is recorded on the rising edge of a
+        highlight or when it jumps; the recall screen is the board shown without a highlight."""
+        now = time.time() if now is None else now
+        if rel is not None:
+            self._no_dot_since = None
+            if self._new_trial:
+                self.reset()
+            moved = bool(self.dots) and (abs(rel[0] - self.dots[-1][0]) + abs(rel[1] - self.dots[-1][1]) > self.MOVE_EPS)
+            if not self._hi_visible or moved:
+                self.dots.append(rel)
+            self._hi_visible = True
+        else:
+            self._hi_visible = False
+            if board_present and self.dots:
+                self._aon_no_hi_since = self._aon_no_hi_since or now
+                if now - self._aon_no_hi_since >= self.RECALL_CONFIRM_S:
+                    self.recall, self._new_trial = True, True
+            elif not board_present:
+                self._aon_no_hi_since = None
 
     def _dot_mask(self, h):
         if self.dot_hsv is not None:
@@ -267,7 +294,295 @@ class DotTracker:
         return [f"{i + 1}: {where(p)} ({p[0]:.2f},{p[1]:.2f})" for i, p in enumerate(self.dots)]
 
 
+# --------------------------------------------------------------- Aon / assess.ly rendering
+# The real P&G (Aon smartPredict) gridChallenge uses low-saturation panels: a medium-gray dot
+# board, darker-gray task squares, and a black dot ringed in orange for the highlight. The
+# colour-panel path above never fires on it, so these detectors handle that look directly.
+AON_BOARD_LO, AON_BOARD_HI = 150, 225   # board grey value band
+
+
+def _aon_highlight(frame):
+    """The highlighted dot (black centre, orange/red ring). -> (cx, cy, Box) or None."""
+    h = hsv(frame)
+    m = ((h[:, :, 0] <= 22) & (h[:, :, 1] >= 110) & (h[:, :, 2] >= 110)).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    cands = [(b, a, c) for b, a, c in components(m, min_area=60) if 0.5 < b.w / b.h < 2.0]
+    if not cands:
+        return None
+    b, _, (cx, cy) = max(cands, key=lambda t: t[1])
+    return cx, cy, b
+
+
+def _aon_board(frame):
+    """The medium-gray dot board (memorise / recall screens). -> Box or None."""
+    h = hsv(frame)
+    gray = (h[:, :, 1] < 45) & (h[:, :, 2] >= AON_BOARD_LO) & (h[:, :, 2] <= AON_BOARD_HI)
+    m = cv2.morphologyEx(gray.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area_min = 0.05 * frame.shape[0] * frame.shape[1]
+    best = None
+    for c in cnts:
+        x, y, w, hh = cv2.boundingRect(c)
+        a = cv2.contourArea(c)
+        if a >= area_min and a >= 0.8 * w * hh and w > hh and (best is None or a > best[0]):
+            best = (a, Box(x, y, w, hh))
+    return best[1] if best else None
+
+
+def _aon_dots(frame, board):
+    """All dot centres on the board, normalised. Dots are darker-gray discs on the gray board."""
+    sub = board.crop(frame)
+    h = hsv(sub)
+    dark = ((h[:, :, 1] < 60) & (h[:, :, 2] < AON_BOARD_LO - 20)).astype(np.uint8) * 255
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    side = min(board.w, board.h)
+    out = []
+    for b, a, (cx, cy) in components(dark, min_area=int((side * 0.02) ** 2)):
+        if 0.6 < b.w / b.h < 1.6 and a > 0.55 * b.area and b.w < side * 0.2:
+            out.append((cx / board.w, cy / board.h))
+    return out
+
+
+def _where(p):
+    col = ("left", "centre", "right")[min(2, int(p[0] * 3))]
+    row = ("top", "middle", "bottom")[min(2, int(p[1] * 3))]
+    return f"{row}-{col}"
+
+
+# -------- Aon interference tasks (shown between memorise boards): symmetry / rotation / arithmetic
+# These sit on a LIGHTER grey panel than the memorise board, so _aon_board never claims them and
+# they are routed here instead. Each is answered by structure, verified on the real captures.
+AON_TASK_LO, AON_TASK_HI = 226, 245   # the task-screen panel (lighter than the 190-grey board)
+
+
+def _aon_task_panel(frame):
+    """The light-grey rounded panel that carries an interference task. -> Box or None."""
+    h = hsv(frame)
+    gray = (h[:, :, 1] < 50) & (h[:, :, 2] >= AON_TASK_LO) & (h[:, :, 2] <= AON_TASK_HI)
+    m = cv2.morphologyEx(gray.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area_min = 0.05 * frame.shape[0] * frame.shape[1]
+    best = None
+    for c in cnts:
+        x, y, w, hh = cv2.boundingRect(c)
+        a = cv2.contourArea(c)
+        if a >= area_min and a >= 0.7 * w * hh and (best is None or a > best[0]):
+            best = (a, Box(x, y, w, hh))
+    return best[1] if best else None
+
+
+def _aon_elements(frame, panel):
+    """Dark lattice marks (small dots + big squares) on a symmetry/rotation panel.
+    -> [(cx, cy, area, Box)] in frame coordinates."""
+    h = hsv(panel.crop(frame))
+    dark = ((h[:, :, 1] < 90) & (h[:, :, 2] < 180)).astype(np.uint8) * 255
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    side = min(panel.w, panel.h)
+    out = []
+    for b, a, (cx, cy) in components(dark, min_area=int((side * 0.008) ** 2)):
+        if 0.45 < b.w / b.h < 2.2 and a > 0.5 * b.area and b.w < side * 0.25:
+            out.append((cx + panel.x, cy + panel.y, a, Box(b.x + panel.x, b.y + panel.y, b.w, b.h)))
+    return out
+
+
+def _squares(els):
+    """1 for a big (filled square) mark, 0 for a small (empty) dot. None if only one size exists."""
+    cls = _size_classes([e[2] for e in els])
+    if len(set(cls)) < 2:
+        return None
+    return [1 if c == 2 else 0 for c in cls]
+
+
+def _aon_symmetry(els, sq):
+    px, py = _pitch(els)
+    if not px or not py:
+        return None
+    m = _grid_matrix(els, sq, (min(e[0] for e in els), min(e[1] for e in els)), (px, py))
+    cols = m.shape[1]
+    if cols < 4 or cols % 2:
+        return None
+    diff = int(np.count_nonzero(m[:, :cols // 2] != np.fliplr(m[:, cols // 2:])))
+    return {"mode": "Grid · symmetrical?", "big": "YES" if diff == 0 else "NO",
+            "lines": [f"grid {m.shape[0]}x{cols}, mirror mismatch {diff}"]}
+
+
+def _aon_rotation(els, sq):
+    xc = sorted(e[0] for e in els)
+    gap, at = max((xc[k + 1] - xc[k], k) for k in range(len(xc) - 1))
+    px = grid_spacing([e[0] for e in els], min_gap=20)
+    if not px or gap < 1.6 * px:
+        return None                       # one continuous grid -> not a two-figure rotation task
+    thr = (xc[at] + xc[at + 1]) / 2
+    left = [(e, s) for e, s in zip(els, sq) if e[0] < thr]
+    right = [(e, s) for e, s in zip(els, sq) if e[0] >= thr]
+    if min(len(left), len(right)) < 6 or abs(len(left) - len(right)) > 0.3 * len(els):
+        return None
+    el, sl = [e for e, _ in left], [s for _, s in left]
+    er, sr = [e for e, _ in right], [s for _, s in right]
+    ml = _grid_matrix(el, sl, (min(e[0] for e in el), min(e[1] for e in el)), _pitch(el))
+    mr = _grid_matrix(er, sr, (min(e[0] for e in er), min(e[1] for e in er)), _pitch(er))
+
+    def closest(cands):
+        return min((int(np.count_nonzero(c != mr)) if c.shape == mr.shape else 999) for c in cands)
+
+    rot = closest([np.rot90(ml, k) for k in range(4)])
+    mir = closest([np.rot90(np.fliplr(ml), k) for k in range(4)])
+    yes = rot <= 2 and rot <= mir
+    note = "ambiguous (symmetric)" if rot == mir else f"rot {rot} / mirror {mir}"
+    return {"mode": "Grid · rotated & identical?", "big": "YES" if yes else "NO",
+            "lines": [f"{ml.shape[0]}x{ml.shape[1]} · {note}"]}
+
+
+def _aon_white_boxes(frame, panel):
+    """The white figure boxes of an arithmetic task (A, B, C). -> list of Box."""
+    h = hsv(panel.crop(frame))
+    w = ((h[:, :, 1] < 40) & (h[:, :, 2] >= 244)).astype(np.uint8) * 255
+    w = cv2.morphologyEx(w, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    side = min(panel.w, panel.h)
+    out = []
+    for b, a, _ in components(w, min_area=int((side * 0.15) ** 2)):
+        if 0.75 < b.w / b.h < 1.3 and a > 0.8 * b.area:
+            out.append(Box(b.x + panel.x, b.y + panel.y, b.w, b.h))
+    return out
+
+
+def _fig_lattice_n(frame, box):
+    """How many dots per side (grid is N x N). Dots are small round dark marks; strokes are long,
+    so they are filtered out. -> N (0 if too few dots to tell)."""
+    h = hsv(box.crop(frame))
+    side = box.w
+    xs, ys = [], []
+    for b, a, (cx, cy) in components((h[:, :, 2] < 150).astype(np.uint8) * 255, min_area=int((0.02 * side) ** 2)):
+        if 0.55 < b.w / b.h < 1.8 and max(b.w, b.h) < 0.16 * side and a > 0.55 * b.area:
+            xs.append(cx)
+            ys.append(cy)
+
+    def n_lines(vals):
+        vals = sorted(vals)
+        return 1 + sum(vals[i] - vals[i - 1] > 0.10 * side for i in range(1, len(vals))) if vals else 0
+
+    return max(n_lines(xs), n_lines(ys))
+
+
+def _fig_edges(frame, box, n):
+    """Which unit segments of the n x n dot lattice are drawn in one figure box. -> set of names.
+    Named H row col (horizontal), V (vertical), D ('\\' diagonal), A ('/' diagonal). Sampled strictly
+    between dots; diagonals sampled off-centre so a crossing X keeps both arms distinct."""
+    m = (hsv(box.crop(frame))[:, :, 2] < 150).astype(np.uint8)
+    fr = [(i + 0.5) / n for i in range(n)]
+    rad = max(6, int(box.w * 0.02))
+
+    def dark(px, py):
+        win = m[max(0, py - rad):py + rad + 1, max(0, px - rad):px + rad + 1]
+        return win.size and win.mean() > 0.30
+
+    def pt(r, c):
+        return (fr[c] * box.w, fr[r] * box.h)
+
+    def seg(a, b, ts, need):
+        p, q = pt(*a), pt(*b)
+        return sum(bool(dark(int(p[0] + (q[0] - p[0]) * t), int(p[1] + (q[1] - p[1]) * t))) for t in ts) >= need
+
+    hv, dg, e = (0.3, 0.4, 0.5, 0.6, 0.7), (0.25, 0.35, 0.65, 0.75), set()
+    for r in range(n):
+        for c in range(n - 1):
+            if seg((r, c), (r, c + 1), hv, 4):
+                e.add(f"H{r}{c}")
+    for c in range(n):
+        for r in range(n - 1):
+            if seg((r, c), (r + 1, c), hv, 4):
+                e.add(f"V{r}{c}")
+    for r in range(n - 1):
+        for c in range(n - 1):
+            if seg((r, c), (r + 1, c + 1), dg, 4):
+                e.add(f"D{r}{c}")
+            if seg((r, c + 1), (r + 1, c), dg, 4):
+                e.add(f"A{r}{c}")
+    return e
+
+
+def _fig_operator(frame, a, b):
+    x0, x1 = a.x + a.w, b.x
+    if x1 - x0 < 6:
+        return "+"
+    comps = components(((hsv(frame[min(a.y, b.y):max(a.y + a.h, b.y + b.h), x0:x1])[:, :, 2] < 150)
+                        ).astype(np.uint8) * 255, min_area=20)
+    if not comps:
+        return "+"
+    bx = max(comps, key=lambda c: c[1])[0]
+    return "+" if bx.h > 0.55 * bx.w else "-"
+
+
+def _aon_arithmetic(frame, boxes):
+    boxes = sorted(boxes, key=lambda b: -b.area)[:3]
+    top = sorted(boxes, key=lambda b: b.y)
+    a, b = sorted(top[:2], key=lambda x: x.x)
+    c = top[2]
+    n = min(max(max(_fig_lattice_n(frame, x) for x in (a, b, c)), 3), 6)  # all three share one lattice
+    op = _fig_operator(frame, a, b)
+    ea, eb, ec = _fig_edges(frame, a, n), _fig_edges(frame, b, n), _fig_edges(frame, c, n)
+    got = (ea | eb) if op == "+" else (ea - eb)
+    miss = got ^ ec
+    return {"mode": f"Grid · A {op} B = C?", "big": "YES" if not miss else "NO",
+            "lines": [f"{n}x{n} · A{op}B={''.join(sorted(got)) or '-'} vs C={''.join(sorted(ec)) or '-'}",
+                      f"mismatch {len(miss)}"]}
+
+
+def _aon_task(frame):
+    """An interference task between memorise boards (not a dot board). -> result dict or None."""
+    panel = _aon_task_panel(frame)
+    if panel is None:
+        return None
+    boxes = _aon_white_boxes(frame, panel)
+    if len(boxes) >= 3:
+        return _aon_arithmetic(frame, boxes)
+    els = _aon_elements(frame, panel)
+    if len(els) < 20:
+        return None
+    sq = _squares(els)
+    if sq is None:
+        return None
+    return _aon_rotation(els, sq) or _aon_symmetry(els, sq)
+
+
+def _aon_analyse(frame, tracker):
+    """Aon gridChallenge. -> result dict or None (not an Aon screen)."""
+    board = _aon_board(frame)
+    hi = _aon_highlight(frame)
+    if board is not None and hi is not None:          # memorise screen
+        rel = ((hi[0] - board.x) / board.w, (hi[1] - board.y) / board.h)
+        tracker.aon_see(rel, board_present=True)
+        n = len(tracker.dots)
+        return {"mode": "Grid memorise", "big": f"{n}: {_where(rel)}",
+                "lines": ["remembered so far:"] + [f"{i + 1}. {_where(p)}" for i, p in enumerate(tracker.dots)],
+                "dots": list(tracker.dots), "holes": []}
+    if board is not None:                             # board, no highlight -> recall / gap
+        tracker.aon_see(None, board_present=True)
+        if tracker.recall and tracker.dots:
+            actual = _aon_dots(frame, board)
+            picks = []
+            for p in tracker.dots:
+                near = min(actual, key=lambda q: (q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2, default=p)
+                picks.append(near)
+            return {"mode": "Grid RECALL", "big": f"click {len(picks)} dots",
+                    "lines": [f"{i + 1}. {_where(p)}" for i, p in enumerate(picks)],
+                    "dots": picks, "holes": actual}
+        n = len(tracker.dots)
+        return {"mode": "Grid", "big": f"{n} memorised",
+                "lines": [f"{i + 1}. {_where(p)}" for i, p in enumerate(tracker.dots)],
+                "dots": list(tracker.dots), "holes": []}
+    task = _aon_task(frame)                            # no board: an interference task, or not Aon
+    if task is not None:
+        task["dots"], task["holes"] = list(tracker.dots), []
+        if tracker.dots:
+            task["lines"] = task["lines"] + [f"({len(tracker.dots)} dots held in memory)"]
+    return task
+
+
 def analyse(frame, tracker: DotTracker):
+    aon = _aon_analyse(frame, tracker)
+    if aon is not None:
+        return aon
     panel, dark = find_panel(frame)
     if panel is None:
         return None

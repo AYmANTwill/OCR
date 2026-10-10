@@ -6,7 +6,7 @@ Structure used (no colours or positions hard-coded):
   * the input flows through the rows top -> bottom; a row with several boxes is a choice.
 The answer is the one choice per row whose composition maps the top row onto the bottom row.
 """
-from itertools import combinations, product
+from itertools import combinations, permutations, product
 
 import cv2
 import numpy as np
@@ -80,8 +80,14 @@ def _sym_cost(a, b):
 
 
 def find_symbol_rows(frame):
-    """-> (top_run, bottom_run) or None. Both runs hold the same n symbols."""
+    """-> (top_run, bottom_run) or None. Both runs hold the same n symbols.
+
+    The input/output rows are the prominent shapes, so large symbols are preferred: some
+    skins print a miniature of each box's result under it, and those tiny shapes form their
+    own hue-matched rows that would otherwise win on alignment alone.
+    """
     runs = _rows_of_symbols(_symbol_candidates(frame))
+    biggest = max((np.median([c["box"].h for c in r]) for r in runs), default=0)
     best = None
     for top in runs:
         for bot in runs:
@@ -89,8 +95,10 @@ def find_symbol_rows(frame):
                 continue
             if sorted(c["hue"] for c in top) != sorted(c["hue"] for c in bot):
                 continue
-            # input and output rows are vertically aligned
-            score = abs(np.mean([c["box"].cx for c in top]) - np.mean([c["box"].cx for c in bot]))
+            size = min(np.median([c["box"].h for c in top]), np.median([c["box"].h for c in bot]))
+            align = abs(np.mean([c["box"].cx for c in top]) - np.mean([c["box"].cx for c in bot]))
+            # prefer rows whose symbols are near the largest found, then the best-aligned pair
+            score = (size < 0.6 * biggest, align)
             if best is None or score < best[0]:
                 best = (score, top, bot)
     return (best[1], best[2]) if best else None
@@ -152,6 +160,31 @@ def compose_all(rows):
         for r, c in zip(rows, choice):
             idx = [idx[j - 1] for j in r[c]]
         out[choice] = tuple(idx)
+    return out
+
+
+def compose_chain(boxes, n=None):
+    """Compose a straight chain of boxes top->bottom applied to identity. -> perm tuple."""
+    n = n or len(boxes[0])
+    idx = list(range(1, n + 1))
+    for b in boxes:
+        idx = [idx[j - 1] for j in b]
+    return tuple(idx)
+
+
+def solve_unknown(target, boxes):
+    """Operator-conversion ('inverted') variant: a straight chain of operators in which one
+    box is unknown, e.g. input + 1324 + x + 3241 = output. `boxes` is the chain with exactly
+    one None where the unknown sits; `target` is the permutation mapping input onto output
+    (symbol_permutation(top, bottom)). -> every box value for the hole that makes the chain
+    hold (normally one), as perm tuples. n is small so this is an exhaustive, exact search.
+    """
+    n = len(target)
+    hole = boxes.index(None)
+    out = []
+    for cand in permutations(range(1, n + 1)):
+        if compose_chain(boxes[:hole] + [list(cand)] + boxes[hole + 1:], n) == tuple(target):
+            out.append(cand)
     return out
 
 

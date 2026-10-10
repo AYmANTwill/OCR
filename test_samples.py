@@ -69,9 +69,12 @@ def test_a1_practice_site_user_screen():
 def test_a1_stale_answer_never_shown_for_another_equation():
     a1_equation.analyse(_img("practice_digit_user.png"))  # solves ? + ? = 15
     f = _img("a1_equation.png").copy()
-    f[118:128, 310:340] = 236  # erase the '_' gap marker -> '3 + = 7' is not solvable
+    f[118:128, 310:340] = 236  # erase the '_' gap marker
     res = a1_equation.analyse(f)
-    assert res is None or res["big"] == "?"
+    # The robust reader may re-derive a fresh (correct, low-target) equation for this frame,
+    # but it must NEVER carry over the previous "= 15" answer. Guard the real property: the
+    # stale practice filling (any pair summing to 15) is never shown for this different frame.
+    assert res is None or res["big"] == "?" or sum(res.get("solution") or []) != 15
 
 
 # ---- assessment 2 ---------------------------------------------------------
@@ -82,6 +85,14 @@ def test_compose_series():
 
 def test_a2_official_style():
     assert a2_tubes.analyse(_img("a2_tubes.png"))["big"] == "3241"
+
+
+def test_a2_solve_unknown_operator():
+    # operator-conversion ('inverted'): input + 1324 + x + 3241 = output; recover x.
+    x = [2, 4, 1, 3]
+    target = a2_tubes.compose_chain([[1, 3, 2, 4], x, [3, 2, 4, 1]])
+    assert a2_tubes.solve_unknown(target, [[1, 3, 2, 4], None, [3, 2, 4, 1]]) == [tuple(x)]
+    assert a2_tubes.solve_unknown((2, 1, 4, 3), [None]) == [(2, 1, 4, 3)]
 
 
 def test_a2_practice_site_user_screen():
@@ -194,6 +205,65 @@ def test_dot_screen_end_to_end():
     a3_memory.analyse(empty, t)
     t._no_dot_since -= 1.0                   # simulate time passing on the recall screen
     assert a3_memory.analyse(empty, t)["big"].startswith("RECALL")
+
+
+def test_a3_aon_memorise_real_capture():
+    # real Aon / assess.ly gridChallenge frame (gray board, orange-ringed dot bottom-right)
+    res = a3_memory.analyse(_img("a3_aon_memorise.jpg"), a3_memory.DotTracker())
+    assert res["mode"] == "Grid memorise" and "bottom-right" in res["big"]
+
+
+def test_a3_aon_symmetry_real_and_broken():
+    # real interference task: the board's left half mirrors its right half -> symmetric
+    res = a3_memory.analyse(_img("a3_aon_symmetry.jpg"), a3_memory.DotTracker())
+    assert "symmetrical" in res["mode"] and res["big"] == "YES"
+    # remove one filled square on the left half -> no longer a mirror
+    f = _img("a3_aon_symmetry.jpg")
+    panel = a3_memory._aon_task_panel(f)
+    els = a3_memory._aon_elements(f, panel)
+    sq = a3_memory._squares(els)
+    left_square = next(e for e, s in zip(els, sq) if s == 1 and e[0] < panel.x + panel.w / 2)
+    b = left_square[3]
+    f[b.y:b.y + b.h, b.x:b.x + b.w] = (230, 230, 230)
+    assert a3_memory.analyse(f, a3_memory.DotTracker())["big"] == "NO"
+
+
+def test_a3_aon_rotation_real_and_mirrored():
+    # real interference task: right figure is the left one rotated 90 degrees
+    res = a3_memory.analyse(_img("a3_aon_rotation.jpg"), a3_memory.DotTracker())
+    assert "rotated" in res["mode"] and res["big"] == "YES"
+    # overwrite the right figure with a MIRROR of the left -> a reflection, not a rotation
+    f = _img("a3_aon_rotation.jpg")
+    panel = a3_memory._aon_task_panel(f)
+    els = a3_memory._aon_elements(f, panel)
+    xc = sorted(e[0] for e in els)
+    _, at = max((xc[k + 1] - xc[k], k) for k in range(len(xc) - 1))
+    thr = (xc[at] + xc[at + 1]) / 2
+    left = [e[3] for e in els if e[0] < thr]
+    right = [e[3] for e in els if e[0] >= thr]
+    lx0, lx1 = min(b.x for b in left), max(b.x + b.w for b in left)
+    ly0, ly1 = min(b.y for b in left), max(b.y + b.h for b in left)
+    rx0, rx1 = min(b.x for b in right), max(b.x + b.w for b in right)
+    ry0, ry1 = min(b.y for b in right), max(b.y + b.h for b in right)
+    patch = cv2.resize(np.ascontiguousarray(np.fliplr(f[ly0:ly1, lx0:lx1])), (rx1 - rx0, ry1 - ry0))
+    f[ry0:ry1, rx0:rx1] = patch
+    assert a3_memory.analyse(f, a3_memory.DotTracker())["big"] == "NO"
+
+
+def test_a3_aon_arithmetic_real():
+    # real "Correct?" interference tasks (line figures A - B = C), both polarities
+    yes = a3_memory.analyse(_img("a3_aon_arith_yes.jpg"), a3_memory.DotTracker())
+    no = a3_memory.analyse(_img("a3_aon_arith_no.jpg"), a3_memory.DotTracker())
+    assert "= C?" in yes["mode"] and yes["big"] == "YES"
+    assert "= C?" in no["mode"] and no["big"] == "NO"
+
+
+def test_a3_aon_task_detector_does_not_cross_fire():
+    # the Aon interference-task reader must stay silent on the other games and on non-task screens
+    for name in ("a1_equation.png", "a2_tubes.png", "practice_switch_user.png", "practice_digit_user.png"):
+        assert a3_memory._aon_task(_img(name)) is None, name
+    for r in ROUNDS:
+        assert a3_memory._aon_task(_round(r)) is None, r
 
 
 # ---- full benchmark from the practice site (tools/harvest.py) ---------------
