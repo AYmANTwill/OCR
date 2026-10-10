@@ -213,6 +213,59 @@ def test_a3_aon_memorise_real_capture():
     assert res["mode"] == "Grid memorise" and "bottom-right" in res["big"]
 
 
+def test_a3_aon_symmetry_real_and_broken():
+    # real interference task: the board's left half mirrors its right half -> symmetric
+    res = a3_memory.analyse(_img("a3_aon_symmetry.jpg"), a3_memory.DotTracker())
+    assert "symmetrical" in res["mode"] and res["big"] == "YES"
+    # remove one filled square on the left half -> no longer a mirror
+    f = _img("a3_aon_symmetry.jpg")
+    panel = a3_memory._aon_task_panel(f)
+    els = a3_memory._aon_elements(f, panel)
+    sq = a3_memory._squares(els)
+    left_square = next(e for e, s in zip(els, sq) if s == 1 and e[0] < panel.x + panel.w / 2)
+    b = left_square[3]
+    f[b.y:b.y + b.h, b.x:b.x + b.w] = (230, 230, 230)
+    assert a3_memory.analyse(f, a3_memory.DotTracker())["big"] == "NO"
+
+
+def test_a3_aon_rotation_real_and_mirrored():
+    # real interference task: right figure is the left one rotated 90 degrees
+    res = a3_memory.analyse(_img("a3_aon_rotation.jpg"), a3_memory.DotTracker())
+    assert "rotated" in res["mode"] and res["big"] == "YES"
+    # overwrite the right figure with a MIRROR of the left -> a reflection, not a rotation
+    f = _img("a3_aon_rotation.jpg")
+    panel = a3_memory._aon_task_panel(f)
+    els = a3_memory._aon_elements(f, panel)
+    xc = sorted(e[0] for e in els)
+    _, at = max((xc[k + 1] - xc[k], k) for k in range(len(xc) - 1))
+    thr = (xc[at] + xc[at + 1]) / 2
+    left = [e[3] for e in els if e[0] < thr]
+    right = [e[3] for e in els if e[0] >= thr]
+    lx0, lx1 = min(b.x for b in left), max(b.x + b.w for b in left)
+    ly0, ly1 = min(b.y for b in left), max(b.y + b.h for b in left)
+    rx0, rx1 = min(b.x for b in right), max(b.x + b.w for b in right)
+    ry0, ry1 = min(b.y for b in right), max(b.y + b.h for b in right)
+    patch = cv2.resize(np.ascontiguousarray(np.fliplr(f[ly0:ly1, lx0:lx1])), (rx1 - rx0, ry1 - ry0))
+    f[ry0:ry1, rx0:rx1] = patch
+    assert a3_memory.analyse(f, a3_memory.DotTracker())["big"] == "NO"
+
+
+def test_a3_aon_arithmetic_real():
+    # real "Correct?" interference tasks (line figures A - B = C), both polarities
+    yes = a3_memory.analyse(_img("a3_aon_arith_yes.jpg"), a3_memory.DotTracker())
+    no = a3_memory.analyse(_img("a3_aon_arith_no.jpg"), a3_memory.DotTracker())
+    assert "= C?" in yes["mode"] and yes["big"] == "YES"
+    assert "= C?" in no["mode"] and no["big"] == "NO"
+
+
+def test_a3_aon_task_detector_does_not_cross_fire():
+    # the Aon interference-task reader must stay silent on the other games and on non-task screens
+    for name in ("a1_equation.png", "a2_tubes.png", "practice_switch_user.png", "practice_digit_user.png"):
+        assert a3_memory._aon_task(_img(name)) is None, name
+    for r in ROUNDS:
+        assert a3_memory._aon_task(_round(r)) is None, r
+
+
 # ---- full benchmark from the practice site (tools/harvest.py) ---------------
 def test_benchmark_every_harvested_task():
     import glob

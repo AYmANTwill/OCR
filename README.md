@@ -8,10 +8,13 @@ official Aon look, the switch-challenge-pratice.org look, light and dark themes,
 |---|---|---|
 | A1 DigitChallenge | the text line holding an `=`; each character classified by shape (`?` hook+dot, `=`, `+`, `×`, `÷`, `−`, `(` `)`, `_` gap); digits by font templates. When a skin draws the answer slots as filled/empty pills or bare boxes (no `?` ink) or hides thin `+` signs, a robust reader takes over: it scans the band for the operator/paren glyphs only (and anchors on the `=` glyph when empty slots leave no line to find), rebuilds the slot layout from grammar (`#operands = #binary-operators + 1`), and reads the target number with the on-screen 1–9 keypad (same font) plus OCR. Verified ~99% on a synthetic matrix of structure × slot-style × theme × font × size (`tools/synth_bench.py`) | digits to type, left→right (distinct 1–9) + alternatives |
 | A2 SwitchChallenge | the two rows of the same coloured symbols (input/output) — the largest shapes, so a skin that prints a miniature of each box's result underneath it cannot be mistaken for them; every number box between them, grouped in rows; boxes read by 2 OCR engines, only valid permutations kept. Verified across skins (plain / P&G funnels / tiled shapes / shapes-under-numbers) by `tools/switch_bench.py` and 100% on the harvested site. `solve_unknown()` also covers the operator-conversion variant (`input + 1324 + x + 3241 = output`, solve for `x`) | the box(es) to click, e.g. `2134` or `2134 + 2143` for two choice rows |
-| A3 R1 "Is it symmetrical?" | largest single-colour panel (any colour); element grid | YES / NO |
-| A3 R2 "Rotated but identical?" | both grids, 4 rotations vs mirror | YES / NO |
-| A3 R3 "Correct?" (A ± B = C) | line drawings, + / − sign | YES / NO |
-| A3 dot screens | holes + coloured dot | mini-map of the hole layout with dots numbered in order; "RECALL" on the answer screen |
+| A3 Grid memorise (Aon / assess.ly) | the real P&G *gridChallenge* look: a medium-grey dot board with one black dot ringed in **orange** = the highlighted cell. Each board is recorded in order; the board shown with no highlight for ~0.8 s is the recall screen | which cell to remember (e.g. `bottom-right`), then `click N dots` on recall, mapped to the real holes |
+| A3 "Is it symmetrical?" | the lighter-grey task panel: full lattice of dots/squares read into a matrix, split at the centre divider, left compared to the mirror of the right | YES / NO |
+| A3 "Rotated but identical?" | the two figures split at the central gap, each read into a matrix; the right tested against the four rotations **and** the mirror of the left | YES / NO |
+| A3 "Correct?" (A ± B = C) | the three white figure boxes (A, B, C); the dot lattice sized automatically (3×3, 4×4, …), each stroke read as a graph edge, then the edge-set identity `A ± B = C` checked | YES / NO |
+| A3 practice site (coloured panels) | same three tasks + dot screens on the switch-challenge-pratice look: largest single-colour panel, element grid, holes + coloured dot | YES / NO · dot mini-map · "RECALL" |
+
+The A3 reader is verified on 20 real Aon *Working Memory – gridChallenge* captures (memorise, recall, and all three interference tasks) plus controlled mirror/rotation/broken-sum variants (`test_a3_aon_*`).
 
 SwitchChallenge rule used (verified on every harvested level): the input goes through the rows
 of boxes top → bottom; a box `abcd` puts input symbol `a` first, `b` second, …; a row with
