@@ -207,6 +207,12 @@ def test_dot_screen_end_to_end():
     assert a3_memory.analyse(empty, t)["big"].startswith("RECALL")
 
 
+def test_a3_aon_memorise_real_capture():
+    # real Aon / assess.ly gridChallenge frame (gray board, orange-ringed dot bottom-right)
+    res = a3_memory.analyse(_img("a3_aon_memorise.jpg"), a3_memory.DotTracker())
+    assert res["mode"] == "Grid memorise" and "bottom-right" in res["big"]
+
+
 # ---- full benchmark from the practice site (tools/harvest.py) ---------------
 def test_benchmark_every_harvested_task():
     import glob

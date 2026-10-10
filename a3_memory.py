@@ -208,11 +208,38 @@ class DotTracker:
         self.dot_hsv = None  # set by the calibrate hotkey
         self.recall = False
         self._visible = False
+        self._hi_visible = False
         self._no_dot_since = None
+        self._aon_no_hi_since = None
         self._new_trial = False
 
     def reset(self):
         self.dots, self._visible, self.recall, self._new_trial = [], False, False, False
+        self._hi_visible = False
+        self._aon_no_hi_since = None
+
+    def aon_see(self, rel, board_present, now=None):
+        """Aon rendering: one orange-ringed dot is highlighted per 'memorise' board for a few
+        seconds, with plain task screens in between (no board). `rel` is the highlighted dot's
+        position normalised to the board, or None. A new dot is recorded on the rising edge of a
+        highlight or when it jumps; the recall screen is the board shown without a highlight."""
+        now = time.time() if now is None else now
+        if rel is not None:
+            self._no_dot_since = None
+            if self._new_trial:
+                self.reset()
+            moved = bool(self.dots) and (abs(rel[0] - self.dots[-1][0]) + abs(rel[1] - self.dots[-1][1]) > self.MOVE_EPS)
+            if not self._hi_visible or moved:
+                self.dots.append(rel)
+            self._hi_visible = True
+        else:
+            self._hi_visible = False
+            if board_present and self.dots:
+                self._aon_no_hi_since = self._aon_no_hi_since or now
+                if now - self._aon_no_hi_since >= self.RECALL_CONFIRM_S:
+                    self.recall, self._new_trial = True, True
+            elif not board_present:
+                self._aon_no_hi_since = None
 
     def _dot_mask(self, h):
         if self.dot_hsv is not None:
@@ -267,7 +294,94 @@ class DotTracker:
         return [f"{i + 1}: {where(p)} ({p[0]:.2f},{p[1]:.2f})" for i, p in enumerate(self.dots)]
 
 
+# --------------------------------------------------------------- Aon / assess.ly rendering
+# The real P&G (Aon smartPredict) gridChallenge uses low-saturation panels: a medium-gray dot
+# board, darker-gray task squares, and a black dot ringed in orange for the highlight. The
+# colour-panel path above never fires on it, so these detectors handle that look directly.
+AON_BOARD_LO, AON_BOARD_HI = 150, 225   # board grey value band
+
+
+def _aon_highlight(frame):
+    """The highlighted dot (black centre, orange/red ring). -> (cx, cy, Box) or None."""
+    h = hsv(frame)
+    m = ((h[:, :, 0] <= 22) & (h[:, :, 1] >= 110) & (h[:, :, 2] >= 110)).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    cands = [(b, a, c) for b, a, c in components(m, min_area=60) if 0.5 < b.w / b.h < 2.0]
+    if not cands:
+        return None
+    b, _, (cx, cy) = max(cands, key=lambda t: t[1])
+    return cx, cy, b
+
+
+def _aon_board(frame):
+    """The medium-gray dot board (memorise / recall screens). -> Box or None."""
+    h = hsv(frame)
+    gray = (h[:, :, 1] < 45) & (h[:, :, 2] >= AON_BOARD_LO) & (h[:, :, 2] <= AON_BOARD_HI)
+    m = cv2.morphologyEx(gray.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area_min = 0.05 * frame.shape[0] * frame.shape[1]
+    best = None
+    for c in cnts:
+        x, y, w, hh = cv2.boundingRect(c)
+        a = cv2.contourArea(c)
+        if a >= area_min and a >= 0.8 * w * hh and w > hh and (best is None or a > best[0]):
+            best = (a, Box(x, y, w, hh))
+    return best[1] if best else None
+
+
+def _aon_dots(frame, board):
+    """All dot centres on the board, normalised. Dots are darker-gray discs on the gray board."""
+    sub = board.crop(frame)
+    h = hsv(sub)
+    dark = ((h[:, :, 1] < 60) & (h[:, :, 2] < AON_BOARD_LO - 20)).astype(np.uint8) * 255
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    side = min(board.w, board.h)
+    out = []
+    for b, a, (cx, cy) in components(dark, min_area=int((side * 0.02) ** 2)):
+        if 0.6 < b.w / b.h < 1.6 and a > 0.55 * b.area and b.w < side * 0.2:
+            out.append((cx / board.w, cy / board.h))
+    return out
+
+
+def _where(p):
+    col = ("left", "centre", "right")[min(2, int(p[0] * 3))]
+    row = ("top", "middle", "bottom")[min(2, int(p[1] * 3))]
+    return f"{row}-{col}"
+
+
+def _aon_analyse(frame, tracker):
+    """Aon gridChallenge. -> result dict or None (not an Aon screen)."""
+    board = _aon_board(frame)
+    hi = _aon_highlight(frame)
+    if board is not None and hi is not None:          # memorise screen
+        rel = ((hi[0] - board.x) / board.w, (hi[1] - board.y) / board.h)
+        tracker.aon_see(rel, board_present=True)
+        n = len(tracker.dots)
+        return {"mode": "Grid memorise", "big": f"{n}: {_where(rel)}",
+                "lines": ["remembered so far:"] + [f"{i + 1}. {_where(p)}" for i, p in enumerate(tracker.dots)],
+                "dots": list(tracker.dots), "holes": []}
+    if board is not None:                             # board, no highlight -> recall / gap
+        tracker.aon_see(None, board_present=True)
+        if tracker.recall and tracker.dots:
+            actual = _aon_dots(frame, board)
+            picks = []
+            for p in tracker.dots:
+                near = min(actual, key=lambda q: (q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2, default=p)
+                picks.append(near)
+            return {"mode": "Grid RECALL", "big": f"click {len(picks)} dots",
+                    "lines": [f"{i + 1}. {_where(p)}" for i, p in enumerate(picks)],
+                    "dots": picks, "holes": actual}
+        n = len(tracker.dots)
+        return {"mode": "Grid", "big": f"{n} memorised",
+                "lines": [f"{i + 1}. {_where(p)}" for i, p in enumerate(tracker.dots)],
+                "dots": list(tracker.dots), "holes": []}
+    return None            # no Aon board: a task screen (handled below) or a non-Aon screen
+
+
 def analyse(frame, tracker: DotTracker):
+    aon = _aon_analyse(frame, tracker)
+    if aon is not None:
+        return aon
     panel, dark = find_panel(frame)
     if panel is None:
         return None
